@@ -1,0 +1,23 @@
+# Python virtual environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Secrets & environment variables
+.env
+
+# Local vector DB & heavy data
+db/
+*.sqlite3
+*.bin
+*.pickle
+
+# Frontend dependencies & builds
+frontend/node_modules/
+frontend/dist/
+
+# OS & IDE files
+.vscode/
+.DS_Store
+Thumbs.db
