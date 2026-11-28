@@ -1,7 +1,6 @@
-
 import os
-from langchain_community.document_loaders import TextLoader, DirectoryLoader
-from langchain_text_splitters import CharacterTextSplitter
+from langchain_community.document_loaders import TextLoader, PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_ollama import OllamaEmbeddings
 from langchain_chroma import Chroma
 from dotenv import load_dotenv
@@ -10,37 +9,53 @@ load_dotenv()
 
 
 def load_documents(docs_path="docs"):
-    """Load all text files from the docs directory."""
-    print(f"Loading documents from {docs_path}...")
+    """Load all .txt and .pdf files from the docs directory."""
+    print(f"Loading documents from '{docs_path}'...")
 
     if not os.path.exists(docs_path):
         raise FileNotFoundError(
-            f"The directory {docs_path} does not exist."
+            f"The directory '{docs_path}' does not exist."
         )
 
-    loader = DirectoryLoader(
-        path=docs_path,
-        glob="*.txt",
-        loader_cls=TextLoader,
-        loader_kwargs={"encoding": "utf-8-sig"}
-    )
+    documents = []
+    for root, _, files in os.walk(docs_path):
+        for filename in sorted(files):
+            file_path = os.path.join(root, filename)
+            ext = os.path.splitext(filename)[1].lower()
 
-    documents = loader.load()
+            try:
+                if ext == ".txt":
+                    loader = TextLoader(file_path, encoding="utf-8-sig")
+                    loaded = loader.load()
+                    for doc in loaded:
+                        doc.metadata["source"] = filename
+                        doc.metadata["file_type"] = "txt"
+                    documents.extend(loaded)
+                elif ext == ".pdf":
+                    loader = PyPDFLoader(file_path)
+                    loaded = loader.load()
+                    for doc in loaded:
+                        doc.metadata["source"] = filename
+                        doc.metadata["file_type"] = "pdf"
+                    documents.extend(loaded)
+            except Exception as e:
+                print(f"Warning: Failed to load '{filename}': {e}")
 
     if len(documents) == 0:
         raise FileNotFoundError(
-            f"No .txt files found in {docs_path}."
+            f"No .txt or .pdf files found in '{docs_path}'."
         )
 
-    print(f"Loaded {len(documents)} documents.")
+    print(f"Loaded {len(documents)} document pages/files.")
     return documents
 
 
-def split_documents(documents, chunk_size=1000, chunk_overlap=0):
-    """Split documents into smaller chunks with overlap."""
+def split_documents(documents, chunk_size=1000, chunk_overlap=200):
+    """Split documents into smaller chunks with recursive structure awareness."""
     print("Splitting documents into chunks...")
 
-    text_splitter = CharacterTextSplitter(
+    text_splitter = RecursiveCharacterTextSplitter(
+        separators=["\n\n", "\n", ". ", " ", ""],
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap
     )
@@ -48,28 +63,25 @@ def split_documents(documents, chunk_size=1000, chunk_overlap=0):
     chunks = text_splitter.split_documents(documents)
 
     if chunks:
-        for i, chunk in enumerate(chunks[:5]):
+        for i, chunk in enumerate(chunks[:3]):
             print(f"\n--- Chunk {i+1} ---")
-            print(f"Source: {chunk.metadata['source']}")
+            print(f"Source: {chunk.metadata.get('source', 'Unknown')} (Page: {chunk.metadata.get('page', 'N/A')})")
             print(f"Length: {len(chunk.page_content)} characters")
-            print("Content:")
-            print(chunk.page_content)
+            print(f"Preview: {chunk.page_content[:150]}...")
             print("-" * 50)
 
-        if len(chunks) > 5:
-            print(f"\n... and {len(chunks) - 5} more chunks")
+        if len(chunks) > 3:
+            print(f"\n... and {len(chunks) - 3} more chunks")
 
     return chunks
 
 
-
 def create_vector_store(chunks, persist_directory="db/chroma_ollama"):
-    """Create and persist ChromaDB vector store in batches."""
+    """Create and persist ChromaDB vector store in batches using local Ollama."""
     print("Creating embeddings and storing in ChromaDB...")
 
     embedding_model = OllamaEmbeddings(model="nomic-embed-text")
 
-    # Create an empty persistent vector store.
     vectorstore = Chroma(
         collection_name="rag_documents",
         embedding_function=embedding_model,
@@ -77,99 +89,55 @@ def create_vector_store(chunks, persist_directory="db/chroma_ollama"):
         collection_metadata={"hnsw:space": "cosine"}
     )
 
-    # Add small batches to avoid one large embedding request.
     batch_size = 10
-
     for start in range(0, len(chunks), batch_size):
         batch = chunks[start:start + batch_size]
         vectorstore.add_documents(batch)
-
         completed = min(start + len(batch), len(chunks))
         print(f"Embedded and stored {completed}/{len(chunks)} chunks")
 
     print("--- Finished creating vector store ---")
     print(f"Vector store saved to {persist_directory}")
     print(f"Stored chunks: {vectorstore._collection.count()}")
-
     return vectorstore
-
 
 
 def main():
     """Main ingestion pipeline."""
     print("=== RAG Document Ingestion Pipeline ===\n")
 
-    # Define paths
     docs_path = "docs"
     persistent_directory = "db/chroma_ollama"
 
-    # Check if vector store already exists
     if os.path.exists(persistent_directory):
         print("Checking existing Ollama vector store...")
 
         embedding_model = OllamaEmbeddings(model="nomic-embed-text")
         vectorstore = Chroma(
-        collection_name="rag_documents",
-        persist_directory=persistent_directory,
-        embedding_function=embedding_model
+            collection_name="rag_documents",
+            persist_directory=persistent_directory,
+            embedding_function=embedding_model
         )
 
         chunk_count = vectorstore._collection.count()
-
         if chunk_count > 0:
-            print(
-                f"Loaded existing vector store with "
-                f"{chunk_count} chunks"
-            )
+            print(f"Loaded existing vector store with {chunk_count} chunks")
             return vectorstore
 
         raise RuntimeError(
-            f"The vector store at '{persistent_directory}' "
-            "exists but contains no chunks. Inspect or remove "
-            "this incomplete database before retrying."
+            f"The vector store at '{persistent_directory}' exists but contains no chunks. "
+            "Remove this incomplete database before retrying."
         )
 
     print("Persistent directory does not exist. Initializing vector store...\n")
 
-    # Step 1: Load documents
     documents = load_documents(docs_path)
-
-    # Step 2: Split into chunks
     chunks = split_documents(documents)
-
-    # Step 3: Create vector store
     vectorstore = create_vector_store(chunks, persistent_directory)
 
-    print("\n✅ Ingestion complete! Your documents are now ready for RAG queries.")
+    print("\nIngestion complete! Your documents are now ready for RAG queries.")
     return vectorstore
 
 
 if __name__ == "__main__":
     main()
-
-
-# Sample Document objects for learning (commented out)
-# from langchain_core.documents import Document
-#
-# documents = [
-#     Document(
-#         page_content="Google LLC is an American multinational corporation and technology company focusing on online advertising, search engine technology, cloud computing, computer software, quantum computing, e-commerce, consumer electronics, and artificial intelligence (AI).",
-#         metadata={'source': 'docs/google.txt'}
-#     ),
-#     Document(
-#         page_content="Microsoft Corporation is an American multinational corporation and technology conglomerate headquartered in Redmond, Washington.",
-#         metadata={'source': 'docs/microsoft.txt'}
-#     ),
-#     Document(
-#         page_content="Nvidia Corporation is an American technology company headquartered in Santa Clara, California.",
-#         metadata={'source': 'docs/nvidia.txt'}
-#     ),
-#     Document(
-#         page_content="Space Exploration Technologies Corp., commonly referred to as SpaceX, is an American space technology company headquartered at the Starbase development site in Starbase, Texas.",
-#         metadata={'source': 'docs/spacex.txt'}
-#     ),
-#     Document(
-#         page_content="Tesla, Inc. is an American multinational automotive and clean energy company headquartered in Austin, Texas.",
-#         metadata={'source': 'docs/tesla.txt'}
-#     )
-# ]
